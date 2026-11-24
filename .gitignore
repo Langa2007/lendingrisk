@@ -1,0 +1,16 @@
+cat > .gitignore << 'EOF'
+.env
+*.pem
+target/
+__pycache__/
+.venv/
+*.egg-info/
+node_modules/
+bin/
+out/
+cache/
+*.parquet
+backtest/datasets/raw/
+EOF
+Phases.md
+STRUCTURE.md
