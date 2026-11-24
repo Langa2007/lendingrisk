@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "block_processed.v1",
+  "type": "object",
+  "required": ["schema_version", "trace_id", "protocol", "chain_id", "block_number", "block_hash", "ts"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "trace_id": { "type": "string" },
+    "protocol": { "type": "string" },
+    "chain_id": { "type": "integer" },
+    "block_number": { "type": "integer", "minimum": 0 },
+    "block_hash": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "oracle_update.v1",
+  "type": "object",
+  "required": ["schema_version", "trace_id", "chain_id", "feed", "block_number", "round_id", "answer", "updated_at"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "trace_id": { "type": "string" },
+    "chain_id": { "type": "integer" },
+    "feed": { "type": "string" },
+    "block_number": { "type": "integer", "minimum": 0 },
+    "round_id": { "type": "string" },
+    "answer": { "type": "string", "description": "integer as decimal string; scale by feed decimals" },
+    "decimals": { "type": "integer" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true
+}

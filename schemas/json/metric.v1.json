@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metric.v1",
+  "type": "object",
+  "required": ["schema_version", "trace_id", "protocol", "chain_id", "block_number", "ts", "metric", "value"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "trace_id": { "type": "string" },
+    "protocol": { "type": "string" },
+    "chain_id": { "type": "integer" },
+    "block_number": { "type": "integer", "minimum": 0 },
+    "ts": { "type": "string", "format": "date-time" },
+    "metric": { "type": "string" },
+    "params": { "type": "object" },
+    "value": { "type": "number" },
+    "unit": { "type": "string" },
+    "assumptions_hash": { "type": "string" }
+  },
+  "additionalProperties": true
+}

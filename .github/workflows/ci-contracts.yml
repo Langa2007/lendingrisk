@@ -1,0 +1,10 @@
+name: ci-contracts
+on: [push, pull_request]
+jobs:
+  foundry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: cd 01-solidity-basics && forge build && forge test -vv
+      - run: if [ -f learning/02-erc20-vault/foundry.toml ]; then cd learning/02-erc20-vault && forge build && forge test -vv; fi

@@ -1,0 +1,13 @@
+name: ci-go
+on: [push, pull_request]
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [alerts, api, keeper, cli]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "stable" }
+      - run: cd ${{ matrix.module }} && go vet ./... && go test -race ./...
