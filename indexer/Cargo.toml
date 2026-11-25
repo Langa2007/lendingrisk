@@ -1,6 +1,21 @@
 [package]
-name = "tahadhari-indexer"
+name = "indexer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.88"
+description = "Tahadhari indexer: Aave v3 position and reserve state reconstruction"
 
 [dependencies]
+alloy = { version = "1.0", default-features = false, features = ["std", "provider-http", "rpc-types", "contract", "sol-types", "reqwest-rustls-tls"] }
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+futures = "0.3"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -38,3 +38,4 @@ fork:
 
 check:
 > bash scripts/phase0_check.sh
+include make/phase1.mk
