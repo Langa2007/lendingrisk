@@ -1,7 +1,7 @@
 //! The indexing engine: backfill, live tail, reorg handling. Generic over chain, store and emitter
 //! so every behaviour (restart, idempotency, reorgs) is unit-tested with a scripted fake chain.
 use crate::chain::ChainSource;
-use crate::decode::{decode_logs, topics0};
+use crate::decode::{AaveV3Adapter, ProtocolAdapter};
 use crate::emit::Emitter;
 use crate::metrics;
 use crate::store::Store;
@@ -56,6 +56,7 @@ pub struct Indexer<C: ChainSource, S: Store, E: Emitter> {
     pub store: S,
     pub emitter: E,
     pub cfg: IndexerConfig,
+    adapter: Box<dyn ProtocolAdapter>,
     tokens: TokenMap,
     filter: LogFilter,
     last_reserve_refresh: u64,
@@ -69,6 +70,7 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
             store,
             emitter,
             cfg,
+            adapter: Box::new(AaveV3Adapter),
             tokens: TokenMap::default(),
             filter: LogFilter::default(),
             last_reserve_refresh: 0,
@@ -90,9 +92,12 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
         self.tokens = TokenMap::from_reserves(info.reserves);
         let mut addresses: Vec<Address> = vec![info.pool];
         addresses.extend(self.tokens.atokens());
+        addresses.extend(info.oracle_feeds);
+        addresses.sort();
+        addresses.dedup();
         self.filter = LogFilter {
             addresses,
-            topics0: topics0(),
+            topics0: self.adapter.topics0(),
         };
         self.last_reserve_refresh = head;
         Ok(())
@@ -105,7 +110,7 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
         logs: &[RawLog],
         record_block: bool,
     ) -> Result<usize> {
-        let mut decoded = decode_logs(logs, &self.tokens)?;
+        let mut decoded = self.adapter.decode(logs, &self.tokens)?;
         if decoded
             .touches
             .iter()
@@ -116,7 +121,7 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
                 "event for unknown reserve: refreshing reserve list"
             );
             self.refresh_reserves().await?;
-            decoded = decode_logs(logs, &self.tokens)?;
+            decoded = self.adapter.decode(logs, &self.tokens)?;
         }
         let keys: Vec<(Address, Address)> = decoded
             .touches
@@ -148,6 +153,7 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
             positions,
             reserves: decoded.reserve_updates,
             liquidations: decoded.liquidations,
+            oracle_updates: decoded.oracle_updates,
             emodes: decoded.emodes,
         };
         self.store.apply_block(&write).await?;
@@ -160,6 +166,11 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
             self.emitter
                 .block_processed(&self.cfg.protocol, self.cfg.chain_id, header, n)
                 .await;
+            for update in &write.oracle_updates {
+                self.emitter
+                    .oracle_update(&self.cfg.protocol, self.cfg.chain_id, header, update)
+                    .await;
+            }
         }
         Ok(n)
     }
@@ -366,6 +377,13 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
     /// Run forever until ctrl-c. Errors are logged and retried, never fatal (except a stopped store).
     pub async fn run_live(&mut self) -> Result<()> {
         info!("live tail started");
+        let mut head_notifications = match self.chain.subscribe_new_heads().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(error = %error, "WebSocket subscription failed; falling back to polling");
+                None
+            }
+        };
         let mut backoff = self.cfg.poll;
         loop {
             match self.sync_once().await {
@@ -380,9 +398,22 @@ impl<C: ChainSource, S: Store, E: Emitter> Indexer<C, S, E> {
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             }
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => { info!("ctrl-c: shutting down"); return Ok(()); }
-                _ = tokio::time::sleep(backoff) => {}
+            if let Some(receiver) = head_notifications.as_mut() {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => { info!("ctrl-c: shutting down"); return Ok(()); }
+                    _ = tokio::time::sleep(backoff) => {}
+                    event = receiver.recv() => {
+                        if event.is_none() {
+                            head_notifications = None;
+                            warn!("WebSocket subscription closed; falling back to polling");
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => { info!("ctrl-c: shutting down"); return Ok(()); }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
             }
         }
     }
@@ -429,6 +460,7 @@ mod tests {
             pool: POOL,
             data_provider: DP,
             reserves: reserves(with_usdc),
+            oracle_feeds: vec![],
         }
     }
     fn cfg() -> IndexerConfig {
@@ -482,11 +514,11 @@ mod tests {
         assert_eq!(idx.sync_once().await.unwrap(), 3);
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((1, u(100), u(0), true))
+            Some((1, u(100), u(0), u(0), true))
         );
         assert_eq!(
             store.position(USDC, ALICE).await.unwrap(),
-            Some((2, u(0), u(50), false))
+            Some((2, u(0), u(50), u(0), false))
         );
         assert_eq!(store.position(WETH, BOB).await.unwrap(), None);
         assert_eq!(*em.blocks.lock().unwrap(), vec![1, 2, 3]);
@@ -574,11 +606,11 @@ mod tests {
         idx2.process_block(&h2, &logs, true).await.unwrap();
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((2, u(30), u(0), true))
+            Some((2, u(30), u(0), u(0), true))
         );
         assert_eq!(
             store.position(WETH, BOB).await.unwrap(),
-            Some((3, u(5), u(0), true))
+            Some((3, u(5), u(0), u(0), true))
         );
     }
 
@@ -622,11 +654,11 @@ mod tests {
         idx.sync_once().await.unwrap();
         assert_eq!(
             store.position(WETH, BOB).await.unwrap(),
-            Some((3, u(70), u(0), true))
+            Some((3, u(70), u(0), u(0), true))
         );
         assert_eq!(
             store.position(USDC, ALICE).await.unwrap(),
-            Some((4, u(0), u(5), false))
+            Some((4, u(0), u(5), u(0), false))
         );
         assert_eq!(store.reserve_index(WETH, 3), Some(u(7)));
 
@@ -643,7 +675,7 @@ mod tests {
 
         assert_eq!(
             store.position(WETH, BOB).await.unwrap(),
-            Some((2, u(10), u(0), true)),
+            Some((2, u(10), u(0), u(0), true)),
             "BOB restored to pre-fork value"
         );
         assert_eq!(
@@ -653,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((3, u(150), u(0), true)),
+            Some((3, u(150), u(0), u(0), true)),
             "new fork applied"
         );
         assert_eq!(
@@ -681,7 +713,7 @@ mod tests {
         idx.sync_once().await.unwrap();
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((6, u(10), u(0), true))
+            Some((6, u(10), u(0), u(0), true))
         );
 
         // canonical chain is now SHORTER than our cursor (head 5 < cursor 6) and block 5 differs
@@ -694,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((1, u(1), u(0), true)),
+            Some((1, u(1), u(0), u(0), true)),
             "block-6 data rolled back"
         );
     }
@@ -752,11 +784,11 @@ mod tests {
 
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((17, u(3), u(0), true))
+            Some((17, u(3), u(0), u(0), true))
         );
         assert_eq!(
             store.position(USDC, BOB).await.unwrap(),
-            Some((21, u(0), u(9), false))
+            Some((21, u(0), u(9), u(0), false))
         );
         // event blocks are NOT recorded as cursor positions during backfill, only chunk-end checkpoints are
         let rec = store.processed_blocks();
@@ -794,7 +826,7 @@ mod tests {
         idx.backfill(1, 10).await.unwrap();
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((8, u(8), u(0), true))
+            Some((8, u(8), u(0), u(0), true))
         );
     }
 
@@ -819,7 +851,7 @@ mod tests {
         idx.sync_once().await.unwrap();
         assert_eq!(
             store.position(USDC, ALICE).await.unwrap(),
-            Some((1, u(0), u(7), false))
+            Some((1, u(0), u(7), u(0), false))
         );
     }
 
@@ -841,7 +873,7 @@ mod tests {
         idx.sync_once().await.unwrap();
         assert_eq!(
             store.position(WETH, ALICE).await.unwrap(),
-            Some((26, u(4), u(0), true))
+            Some((26, u(4), u(0), u(0), true))
         );
         assert_eq!(
             store.position(WETH, BOB).await.unwrap(),
@@ -865,11 +897,12 @@ mod tests {
             parent_hash: B256::repeat_byte(salt.wrapping_sub(1)),
             timestamp: 1_700_000_000 + n,
         };
-        let pr = |sup: u64, debt: u64| PositionRead {
+        let pr = |sup: u64, debt: u64, stable_debt: u64| PositionRead {
             asset: WETH,
             account: ALICE,
             scaled_supply: u(sup),
             scaled_debt: u(debt),
+            stable_debt: u(stable_debt),
             collateral_enabled: true,
         };
         let w = |n: u64, p: Vec<PositionRead>| BlockWrite {
@@ -878,34 +911,41 @@ mod tests {
             positions: p,
             reserves: vec![],
             liquidations: vec![],
+            oracle_updates: vec![OracleUpdate {
+                feed: Address::repeat_byte(0x55),
+                round_id: U256::from(n),
+                answer: n.to_string(),
+                updated_at: 1_700_000_000 + n,
+                log_index: 0,
+            }],
             emodes: vec![(BOB, n as u8)],
         };
 
-        s.apply_block(&w(1, vec![pr(10, 0)])).await.unwrap();
-        s.apply_block(&w(2, vec![pr(20, 1)])).await.unwrap();
-        s.apply_block(&w(3, vec![pr(30, 2)])).await.unwrap();
-        s.apply_block(&w(3, vec![pr(30, 2)])).await.unwrap(); // idempotent
+        s.apply_block(&w(1, vec![pr(10, 0, 0)])).await.unwrap();
+        s.apply_block(&w(2, vec![pr(20, 1, 7)])).await.unwrap();
+        s.apply_block(&w(3, vec![pr(30, 2, 9)])).await.unwrap();
+        s.apply_block(&w(3, vec![pr(30, 2, 9)])).await.unwrap(); // idempotent
         assert_eq!(
             s.position(WETH, ALICE).await.unwrap(),
-            Some((3, u(30), u(2), true))
+            Some((3, u(30), u(2), u(9), true))
         );
         // an older block can never overwrite newer latest-state
         s.apply_block(&BlockWrite {
             record_block: false,
-            ..w(2, vec![pr(999, 9)])
+            ..w(2, vec![pr(999, 9, 10)])
         })
         .await
         .unwrap();
         assert_eq!(
             s.position(WETH, ALICE).await.unwrap(),
-            Some((3, u(30), u(2), true))
+            Some((3, u(30), u(2), u(9), true))
         );
-        s.apply_block(&w(2, vec![pr(20, 1)])).await.unwrap();
+        s.apply_block(&w(2, vec![pr(20, 1, 7)])).await.unwrap();
 
         s.rollback_to(2).await.unwrap();
         assert_eq!(
             s.position(WETH, ALICE).await.unwrap(),
-            Some((2, u(20), u(1), true))
+            Some((2, u(20), u(1), u(7), true))
         );
         assert_eq!(s.latest_processed().await.unwrap().unwrap().0, 2);
         assert!(s.processed_hash(3).await.unwrap().is_none());
@@ -918,6 +958,36 @@ mod tests {
     #[tokio::test]
     async fn mem_store_contract() {
         store_scenario(&MemStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn mem_store_oracle_updates_are_idempotent_and_reorg_safe() {
+        let store = MemStore::default();
+        let block = BlockWrite {
+            header: Header {
+                number: 1,
+                hash: B256::repeat_byte(1),
+                parent_hash: B256::ZERO,
+                timestamp: 1_700_000_001,
+            },
+            record_block: true,
+            positions: vec![],
+            reserves: vec![],
+            liquidations: vec![],
+            oracle_updates: vec![OracleUpdate {
+                feed: Address::repeat_byte(0x55),
+                round_id: U256::from(1u64),
+                answer: "123".into(),
+                updated_at: 1_700_000_000,
+                log_index: 3,
+            }],
+            emodes: vec![],
+        };
+        store.apply_block(&block).await.unwrap();
+        store.apply_block(&block).await.unwrap();
+        assert_eq!(store.oracle_update_count(), 1);
+        store.rollback_to(0).await.unwrap();
+        assert_eq!(store.oracle_update_count(), 0);
     }
 
     #[tokio::test]
@@ -994,6 +1064,13 @@ mod tests {
                 tx_hash: B256::repeat_byte(n as u8),
                 log_index: 3,
             }],
+            oracle_updates: vec![OracleUpdate {
+                feed: Address::repeat_byte(0x55),
+                round_id: U256::from(n),
+                answer: n.to_string(),
+                updated_at: 1_700_000_000 + n,
+                log_index: 3,
+            }],
             emodes: vec![(ALICE, n as u8)],
         };
         for n in 1..=3 {
@@ -1003,6 +1080,7 @@ mod tests {
         assert_eq!(count("reserve_state").await, 3);
         assert_eq!(count("liquidation").await, 3);
         assert_eq!(count("account_emode_history").await, 3);
+        assert_eq!(count("oracle_update").await, 3);
         let cat: i32 = sqlx::query_scalar("SELECT category FROM account_emode WHERE chain_id = $1")
             .bind(cid)
             .fetch_one(pg.pool())
@@ -1013,6 +1091,7 @@ mod tests {
         pg.rollback_to(1).await.unwrap();
         assert_eq!(count("reserve_state").await, 1);
         assert_eq!(count("liquidation").await, 1);
+        assert_eq!(count("oracle_update").await, 1);
         let cat: i32 = sqlx::query_scalar("SELECT category FROM account_emode WHERE chain_id = $1")
             .bind(cid)
             .fetch_one(pg.pool())
@@ -1023,6 +1102,7 @@ mod tests {
         pg.rollback_to(0).await.unwrap();
         assert_eq!(count("reserve_state").await, 0);
         assert_eq!(count("account_emode").await, 0);
+        assert_eq!(count("oracle_update").await, 0);
         pg.save_tokens(&reserves(true), 5).await.unwrap();
         assert_eq!(pg.load_tokens().await.unwrap().len(), 2);
     }

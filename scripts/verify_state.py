@@ -105,7 +105,7 @@ def main() -> int:
     mc = w3.eth.contract(address=MULTICALL3, abi=MC_ABI)
 
     # ---------------- 1. sample: DB -> chain ----------------
-    cur.execute("""SELECT asset, account, scaled_supply::text, scaled_debt::text, collateral_enabled, last_block
+    cur.execute("""SELECT asset, account, scaled_supply::text, scaled_debt::text, stable_debt::text, collateral_enabled, last_block
                    FROM position WHERE protocol='aave_v3' AND chain_id=%s AND last_block <= %s
                    ORDER BY random() LIMIT %s""", (chain_id, block, args.sample))
     rows = cur.fetchall()
@@ -123,7 +123,7 @@ def main() -> int:
             calls.append((atoken[asset.lower()], False, token.encode_abi("scaledBalanceOf", args=[u])))
             calls.append((dp_addr, False, dp.encode_abi("getUserReserveData", args=[a, u])))
         res = mc.functions.aggregate3(calls).call(block_identifier=block)
-        for j, (asset, account, s_sup, s_debt, coll, last_block) in enumerate(batch):
+        for j, (asset, account, s_sup, s_debt, s_stable, coll, last_block) in enumerate(batch):
             ok_bal, ret_bal = res[2 * j]
             ok_dp, ret_dp = res[2 * j + 1]
             if not (ok_bal and ok_dp):
@@ -131,13 +131,15 @@ def main() -> int:
                 continue
             chain_sup = int.from_bytes(ret_bal[:32], "big")
             words = [int.from_bytes(ret_dp[k * 32:(k + 1) * 32], "big") for k in range(9)]
-            chain_debt, chain_coll = words[4], bool(words[8])
-            db_sup, db_debt = int(s_sup), int(s_debt)
+            chain_stable, chain_debt, chain_coll = words[1], words[4], bool(words[8])
+            db_sup, db_debt, db_stable = int(s_sup), int(s_debt), int(s_stable)
             checked += 1
-            if (db_sup, db_debt, coll) != (chain_sup, chain_debt, chain_coll):
+            if (db_sup, db_debt, db_stable, coll) != (chain_sup, chain_debt, chain_stable, chain_coll):
                 mismatches.append((asset, account,
-                                   f"db(sup={db_sup}, debt={db_debt}, coll={coll}, last_block={last_block}) "
-                                   f"!= chain(sup={chain_sup}, debt={chain_debt}, coll={chain_coll})"))
+                                   f"db(sup={db_sup}, var_debt={db_debt}, stable_debt={db_stable}, "
+                                   f"coll={coll}, last_block={last_block}) != "
+                                   f"chain(sup={chain_sup}, var_debt={chain_debt}, "
+                                   f"stable_debt={chain_stable}, coll={chain_coll})"))
     print(f"SAMPLE  : {checked - len([m for m in mismatches if 'db(' in m[2]])}/{checked} match")
 
     # ---------------- 2. coverage: chain events -> DB ----------------

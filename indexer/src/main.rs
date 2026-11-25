@@ -46,6 +46,15 @@ struct Opts {
     /// Optional extra failover provider
     #[arg(long, env = "RPC_URL_BACKUP")]
     rpc_url_backup: Option<String>,
+    /// Maximum JSON-RPC requests per second per provider
+    #[arg(long, env = "RPC_RPS", default_value_t = 10)]
+    rpc_rps: u64,
+    /// Matching providers required for each canonical block header
+    #[arg(long, env = "RPC_QUORUM", default_value_t = 1)]
+    rpc_quorum: usize,
+    /// Optional WebSocket endpoint for new-head notifications
+    #[arg(long, env = "WS_RPC_URL")]
+    ws_rpc_url: Option<String>,
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
     /// If set, emit stream:block_processed messages
@@ -57,6 +66,9 @@ struct Opts {
         default_value = "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e"
     )]
     addresses_provider: String,
+    /// Optional first indexed block for a fresh database; set to the deployment block for full history
+    #[arg(long, env = "AAVE_V3_START_BLOCK")]
+    aave_v3_start_block: Option<u64>,
     #[arg(long, env = "CHAIN_ID", default_value_t = 1)]
     chain_id: u64,
     /// Backfill stops this many blocks below head
@@ -87,7 +99,7 @@ enum Cmd {
         #[arg(long)]
         unsafe_tip: bool,
     },
-    /// Catch up and follow the chain. First run on an empty database needs --start-block.
+    /// Catch up and follow the chain. A fresh database needs --start-block or AAVE_V3_START_BLOCK.
     Run {
         #[arg(long)]
         start_block: Option<u64>,
@@ -107,6 +119,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let o = cli.opts;
+    let aave_v3_start_block = o.aave_v3_start_block;
+    let ws_rpc_url = o.ws_rpc_url;
 
     let mut urls: Vec<String> = o
         .rpc_url
@@ -118,7 +132,7 @@ async fn main() -> Result<()> {
     }
     let ap = alloy::primitives::Address::from_str(&o.addresses_provider)
         .context("AAVE_V3_ADDRESSES_PROVIDER is not an address")?;
-    let chain = rpc::RpcChain::new(&urls, ap)?;
+    let chain = rpc::RpcChain::new(&urls, ap, ws_rpc_url, o.rpc_rps, o.rpc_quorum)?;
     let store = PgStore::connect(&o.database_url, "aave_v3", o.chain_id).await?;
 
     let emitter: Box<dyn Emitter> = match o.redis_url.filter(|s| !s.trim().is_empty()) {
@@ -182,8 +196,9 @@ async fn main() -> Result<()> {
             tokio::spawn(metrics::serve(o.metrics_addr));
             idx.init().await?;
             if idx.store.latest_processed().await?.is_none() {
-                let s = start_block
-                    .context("database is empty: pass --start-block <block> for the first run")?;
+                let s = start_block.or(aave_v3_start_block).context(
+                    "database is empty: pass --start-block <block> or set AAVE_V3_START_BLOCK",
+                )?;
                 idx.seed(s).await?;
             } else if let Some(s) = start_block {
                 warn!(

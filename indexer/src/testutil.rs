@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 type Delta = HashMap<(Address, Address), (U256, U256, bool)>;
+type PositionHistoryRow = (U256, U256, U256, bool);
+type LatestPosition = (u64, U256, U256, U256, bool);
 /// Scripted balances for a block: ((asset, account), (scaled_supply, scaled_debt, collateral)).
 pub type DeltaSpec = Vec<((Address, Address), (u64, u64, bool))>;
 
@@ -195,6 +197,7 @@ impl ChainSource for FakeChain {
                 account: *account,
                 scaled_supply: s,
                 scaled_debt: d,
+                stable_debt: U256::ZERO,
                 collateral_enabled: c,
             });
         }
@@ -210,10 +213,11 @@ impl ChainSource for FakeChain {
 #[derive(Default)]
 struct MemInner {
     processed: BTreeMap<u64, B256>,
-    hist: BTreeMap<(Address, Address, u64), (U256, U256, bool)>,
-    pos: HashMap<(Address, Address), (u64, U256, U256, bool)>,
+    hist: BTreeMap<(Address, Address, u64), PositionHistoryRow>,
+    pos: HashMap<(Address, Address), LatestPosition>,
     reserve_rows: BTreeMap<(Address, u64), U256>,
     liqs: BTreeSet<(u64, B256, u64)>,
+    oracle_rows: BTreeSet<(u64, Address, U256, u64)>,
     emode_hist: BTreeMap<(Address, u64), u8>,
     tokens: Vec<ReserveTokens>,
 }
@@ -234,6 +238,9 @@ impl MemStore {
     }
     pub fn liquidation_count(&self) -> usize {
         self.inner.lock().unwrap().liqs.len()
+    }
+    pub fn oracle_update_count(&self) -> usize {
+        self.inner.lock().unwrap().oracle_rows.len()
     }
     pub fn processed_blocks(&self) -> Vec<u64> {
         self.inner
@@ -270,7 +277,12 @@ impl Store for MemStore {
         for p in &w.positions {
             g.hist.insert(
                 (p.asset, p.account, n),
-                (p.scaled_supply, p.scaled_debt, p.collateral_enabled),
+                (
+                    p.scaled_supply,
+                    p.scaled_debt,
+                    p.stable_debt,
+                    p.collateral_enabled,
+                ),
             );
             let newer_exists = g
                 .pos
@@ -280,7 +292,13 @@ impl Store for MemStore {
             if !newer_exists {
                 g.pos.insert(
                     (p.asset, p.account),
-                    (n, p.scaled_supply, p.scaled_debt, p.collateral_enabled),
+                    (
+                        n,
+                        p.scaled_supply,
+                        p.scaled_debt,
+                        p.stable_debt,
+                        p.collateral_enabled,
+                    ),
                 );
             }
         }
@@ -289,6 +307,10 @@ impl Store for MemStore {
         }
         for l in &w.liquidations {
             g.liqs.insert((n, l.tx_hash, l.log_index));
+        }
+        for update in &w.oracle_updates {
+            g.oracle_rows
+                .insert((n, update.feed, update.round_id, update.log_index));
         }
         for (a, c) in &w.emodes {
             g.emode_hist.insert((*a, n), *c);
@@ -314,6 +336,7 @@ impl Store for MemStore {
         g.hist.retain(|(_, _, b), _| *b <= number);
         g.reserve_rows.retain(|(_, b), _| *b <= number);
         g.liqs.retain(|(b, _, _)| *b <= number);
+        g.oracle_rows.retain(|(b, _, _, _)| *b <= number);
         g.emode_hist.retain(|(_, b), _| *b <= number);
         g.processed.retain(|b, _| *b <= number);
         for key in touched {
@@ -324,8 +347,8 @@ impl Store for MemStore {
                 .filter(|((a, u, _), _)| (*a, *u) == key)
                 .max_by_key(|((_, _, b), _)| *b)
                 .map(|((_, _, b), v)| (*b, *v));
-            if let Some((b, (s, d, c))) = latest {
-                g.pos.insert(key, (b, s, d, c));
+            if let Some((b, (s, d, stable, c))) = latest {
+                g.pos.insert(key, (b, s, d, stable, c));
             }
         }
         Ok(())
@@ -349,7 +372,7 @@ impl Store for MemStore {
         &self,
         asset: Address,
         account: Address,
-    ) -> Result<Option<(u64, U256, U256, bool)>> {
+    ) -> Result<Option<(u64, U256, U256, U256, bool)>> {
         Ok(self
             .inner
             .lock()

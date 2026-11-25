@@ -18,11 +18,13 @@ pub struct Decoded {
     pub reserve_updates: Vec<ReserveUpdate>,
     pub emodes: Vec<(Address, u8)>,
     pub liquidations: Vec<LiquidationRow>,
+    pub oracle_updates: Vec<OracleUpdate>,
 }
 
 /// All topic0 values we subscribe to.
 pub fn topics0() -> Vec<B256> {
     vec![
+        MintUnbacked::SIGNATURE_HASH,
         Supply::SIGNATURE_HASH,
         Withdraw::SIGNATURE_HASH,
         Borrow::SIGNATURE_HASH,
@@ -32,8 +34,28 @@ pub fn topics0() -> Vec<B256> {
         ReserveUsedAsCollateralDisabled::SIGNATURE_HASH,
         ReserveDataUpdated::SIGNATURE_HASH,
         UserEModeSet::SIGNATURE_HASH,
+        SwapBorrowRateMode::SIGNATURE_HASH,
+        RebalanceStableBorrowRate::SIGNATURE_HASH,
         BalanceTransfer::SIGNATURE_HASH,
+        AnswerUpdated::SIGNATURE_HASH,
     ]
+}
+
+pub trait ProtocolAdapter: Send + Sync {
+    fn topics0(&self) -> Vec<B256>;
+    fn decode(&self, logs: &[RawLog], tokens: &TokenMap) -> Result<Decoded>;
+}
+
+pub struct AaveV3Adapter;
+
+impl ProtocolAdapter for AaveV3Adapter {
+    fn topics0(&self) -> Vec<B256> {
+        topics0()
+    }
+
+    fn decode(&self, logs: &[RawLog], tokens: &TokenMap) -> Result<Decoded> {
+        decode_logs(logs, tokens)
+    }
 }
 
 macro_rules! dec {
@@ -57,7 +79,10 @@ pub fn decode_logs(logs: &[RawLog], tokens: &TokenMap) -> Result<Decoded> {
         let Some(t0) = log.topics.first() else {
             continue;
         };
-        if *t0 == Supply::SIGNATURE_HASH {
+        if *t0 == MintUnbacked::SIGNATURE_HASH {
+            let e = dec!(MintUnbacked, log);
+            d.touches.insert((e.reserve, e.onBehalfOf));
+        } else if *t0 == Supply::SIGNATURE_HASH {
             let e = dec!(Supply, log);
             d.touches.insert((e.reserve, e.onBehalfOf));
         } else if *t0 == Withdraw::SIGNATURE_HASH {
@@ -112,6 +137,12 @@ pub fn decode_logs(logs: &[RawLog], tokens: &TokenMap) -> Result<Decoded> {
         } else if *t0 == UserEModeSet::SIGNATURE_HASH {
             let e = dec!(UserEModeSet, log);
             d.emodes.push((e.user, e.categoryId));
+        } else if *t0 == SwapBorrowRateMode::SIGNATURE_HASH {
+            let e = dec!(SwapBorrowRateMode, log);
+            d.touches.insert((e.reserve, e.user));
+        } else if *t0 == RebalanceStableBorrowRate::SIGNATURE_HASH {
+            let e = dec!(RebalanceStableBorrowRate, log);
+            d.touches.insert((e.reserve, e.user));
         } else if *t0 == BalanceTransfer::SIGNATURE_HASH {
             // Emitted by an aToken contract; its address tells us which reserve.
             if let Some(asset) = tokens.asset_for_atoken(&log.address) {
@@ -119,6 +150,19 @@ pub fn decode_logs(logs: &[RawLog], tokens: &TokenMap) -> Result<Decoded> {
                 d.touches.insert((asset, e.from));
                 d.touches.insert((asset, e.to));
             }
+        } else if *t0 == AnswerUpdated::SIGNATURE_HASH {
+            let e = dec!(AnswerUpdated, log);
+            let updated_at = e
+                .updatedAt
+                .try_into()
+                .context("Chainlink updatedAt exceeds u64")?;
+            d.oracle_updates.push(OracleUpdate {
+                feed: log.address,
+                round_id: e.roundId,
+                answer: e.current.to_string(),
+                updated_at,
+                log_index: log.log_index,
+            });
         }
     }
     d.reserve_updates = reserve_last.into_values().collect();
@@ -169,7 +213,7 @@ pub mod test_logs {
 mod tests {
     use super::test_logs::*;
     use super::*;
-    use alloy::primitives::{address, U256};
+    use alloy::primitives::{address, I256, U256};
 
     const POOL: Address = address!("00000000000000000000000000000000000000aa");
     const WETH: Address = address!("00000000000000000000000000000000000000e1");
@@ -291,5 +335,52 @@ mod tests {
             log_index: 0,
         };
         assert!(decode_logs(&[log], &tokens()).unwrap().touches.is_empty());
+    }
+
+    #[test]
+    fn chainlink_answer_updates_are_decoded() {
+        let feed = Address::repeat_byte(0x44);
+        let event = AnswerUpdated {
+            current: I256::try_from(U256::from(123u64)).unwrap(),
+            roundId: U256::from(9u64),
+            updatedAt: U256::from(1_700_000_000u64),
+        };
+        let decoded = decode_logs(&[raw(&event, feed, 10, 4)], &tokens()).unwrap();
+        assert_eq!(decoded.oracle_updates.len(), 1);
+        assert_eq!(decoded.oracle_updates[0].feed, feed);
+        assert_eq!(decoded.oracle_updates[0].round_id, U256::from(9u64));
+        assert_eq!(decoded.oracle_updates[0].answer, "123");
+    }
+
+    #[test]
+    fn less_common_aave_events_touch_affected_positions() {
+        let minted = MintUnbacked {
+            reserve: WETH,
+            user: ALICE,
+            onBehalfOf: BOB,
+            amount: U256::from(1u64),
+            referralCode: 0,
+        };
+        let swapped = SwapBorrowRateMode {
+            reserve: USDC,
+            user: CAROL,
+            interestRateMode: 2,
+        };
+        let rebalanced = RebalanceStableBorrowRate {
+            reserve: USDC,
+            user: ALICE,
+        };
+        let decoded = decode_logs(
+            &[
+                raw(&minted, POOL, 1, 0),
+                raw(&swapped, POOL, 1, 1),
+                raw(&rebalanced, POOL, 1, 2),
+            ],
+            &tokens(),
+        )
+        .unwrap();
+        assert!(decoded.touches.contains(&(WETH, BOB)));
+        assert!(decoded.touches.contains(&(USDC, CAROL)));
+        assert!(decoded.touches.contains(&(USDC, ALICE)));
     }
 }

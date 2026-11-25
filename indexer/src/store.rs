@@ -24,13 +24,13 @@ pub trait Store: Send + Sync {
     async fn load_tokens(&self) -> Result<Vec<ReserveTokens>>;
     /// Forget processed_block rows older than `below` (keeps the table small).
     async fn prune_processed(&self, below: u64) -> Result<()>;
-    /// Latest stored position: (last_block, scaled_supply, scaled_debt, collateral_enabled).
+    /// Latest stored position: (last_block, scaled_supply, scaled_variable_debt, stable_debt, collateral_enabled).
     #[allow(dead_code)] // used by tests; handy for ad-hoc tooling
     async fn position(
         &self,
         asset: Address,
         account: Address,
-    ) -> Result<Option<(u64, U256, U256, bool)>>;
+    ) -> Result<Option<(u64, U256, U256, U256, bool)>>;
 }
 
 pub struct PgStore {
@@ -129,14 +129,20 @@ impl Store for PgStore {
                 .iter()
                 .map(|p| p.scaled_debt.to_string())
                 .collect();
+            let stable_debt: Vec<String> = w
+                .positions
+                .iter()
+                .map(|p| p.stable_debt.to_string())
+                .collect();
             let coll: Vec<bool> = w.positions.iter().map(|p| p.collateral_enabled).collect();
 
             sqlx::query(
-                "INSERT INTO position_history (protocol, chain_id, account, asset, block_number, scaled_supply, scaled_debt, collateral_enabled)
-                 SELECT $1::text, $2::bigint, t.a, t.s, $3::bigint, t.ss::numeric, t.sd::numeric, t.c
-                 FROM UNNEST($4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) AS t(a, s, ss, sd, c)
+                "INSERT INTO position_history (protocol, chain_id, account, asset, block_number, scaled_supply, scaled_debt, stable_debt, collateral_enabled)
+                 SELECT $1::text, $2::bigint, t.a, t.s, $3::bigint, t.ss::numeric, t.sd::numeric, t.st::numeric, t.c
+                 FROM UNNEST($4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::bool[]) AS t(a, s, ss, sd, st, c)
                  ON CONFLICT (protocol, chain_id, account, asset, block_number) DO UPDATE
                    SET scaled_supply = EXCLUDED.scaled_supply, scaled_debt = EXCLUDED.scaled_debt,
+                       stable_debt = EXCLUDED.stable_debt,
                        collateral_enabled = EXCLUDED.collateral_enabled",
             )
             .bind(&self.protocol)
@@ -146,17 +152,19 @@ impl Store for PgStore {
             .bind(&assets)
             .bind(&supply)
             .bind(&debt)
+            .bind(&stable_debt)
             .bind(&coll)
             .execute(&mut *tx)
             .await?;
 
             // Latest-state table: never let an older block overwrite a newer one.
             sqlx::query(
-                "INSERT INTO position (protocol, chain_id, account, asset, scaled_supply, scaled_debt, collateral_enabled, last_block)
-                 SELECT $1::text, $2::bigint, t.a, t.s, t.ss::numeric, t.sd::numeric, t.c, $3::bigint
-                 FROM UNNEST($4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) AS t(a, s, ss, sd, c)
+                "INSERT INTO position (protocol, chain_id, account, asset, scaled_supply, scaled_debt, stable_debt, collateral_enabled, last_block)
+                 SELECT $1::text, $2::bigint, t.a, t.s, t.ss::numeric, t.sd::numeric, t.st::numeric, t.c, $3::bigint
+                 FROM UNNEST($4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::bool[]) AS t(a, s, ss, sd, st, c)
                  ON CONFLICT (protocol, chain_id, account, asset) DO UPDATE
                    SET scaled_supply = EXCLUDED.scaled_supply, scaled_debt = EXCLUDED.scaled_debt,
+                       stable_debt = EXCLUDED.stable_debt,
                        collateral_enabled = EXCLUDED.collateral_enabled, last_block = EXCLUDED.last_block
                    WHERE position.last_block <= EXCLUDED.last_block",
             )
@@ -167,6 +175,7 @@ impl Store for PgStore {
             .bind(&assets)
             .bind(&supply)
             .bind(&debt)
+            .bind(&stable_debt)
             .bind(&coll)
             .execute(&mut *tx)
             .await?;
@@ -211,6 +220,24 @@ impl Store for PgStore {
             .bind(l.debt_repaid.to_string())
             .bind(l.collateral_seized.to_string())
             .bind(addr_str(&l.liquidator))
+            .bind(w.header.timestamp as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for update in &w.oracle_updates {
+            sqlx::query(
+                "INSERT INTO oracle_update (chain_id, feed, block_number, round_id, answer, updated_at, ts)
+                 VALUES ($1, $2, $3, $4::numeric, $5::numeric,
+                         to_timestamp($6::bigint), to_timestamp($7::bigint))
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(self.chain_id)
+            .bind(addr_str(&update.feed))
+            .bind(block)
+            .bind(update.round_id.to_string())
+            .bind(&update.answer)
+            .bind(update.updated_at as i64)
             .bind(w.header.timestamp as i64)
             .execute(&mut *tx)
             .await?;
@@ -313,6 +340,11 @@ impl Store for PgStore {
             .bind(n)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM oracle_update WHERE chain_id = $1 AND block_number > $2")
+            .bind(self.chain_id)
+            .bind(n)
+            .execute(&mut *tx)
+            .await?;
 
         // 3. rebuild latest-state rows for the touched keys from what history remains
         sqlx::query(
@@ -324,9 +356,9 @@ impl Store for PgStore {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO position (protocol, chain_id, account, asset, scaled_supply, scaled_debt, collateral_enabled, last_block)
+            "INSERT INTO position (protocol, chain_id, account, asset, scaled_supply, scaled_debt, stable_debt, collateral_enabled, last_block)
              SELECT DISTINCT ON (h.account, h.asset)
-                    h.protocol, h.chain_id, h.account, h.asset, h.scaled_supply, h.scaled_debt, h.collateral_enabled, h.block_number
+                    h.protocol, h.chain_id, h.account, h.asset, h.scaled_supply, h.scaled_debt, h.stable_debt, h.collateral_enabled, h.block_number
              FROM position_history h JOIN rb_pos k ON k.account = h.account AND k.asset = h.asset
              WHERE h.protocol = $1 AND h.chain_id = $2
              ORDER BY h.account, h.asset, h.block_number DESC",
@@ -417,9 +449,9 @@ impl Store for PgStore {
         &self,
         asset: Address,
         account: Address,
-    ) -> Result<Option<(u64, U256, U256, bool)>> {
+    ) -> Result<Option<(u64, U256, U256, U256, bool)>> {
         let row = sqlx::query(
-            "SELECT last_block, scaled_supply::text, scaled_debt::text, collateral_enabled
+            "SELECT last_block, scaled_supply::text, scaled_debt::text, stable_debt::text, collateral_enabled
              FROM position WHERE protocol = $1 AND chain_id = $2 AND account = $3 AND asset = $4",
         )
         .bind(&self.protocol)
@@ -434,7 +466,8 @@ impl Store for PgStore {
                 r.get::<i64, _>(0) as u64,
                 U256::from_str(&r.get::<String, _>(1))?,
                 U256::from_str(&r.get::<String, _>(2))?,
-                r.get(3),
+                U256::from_str(&r.get::<String, _>(3))?,
+                r.get(4),
             ))),
         }
     }

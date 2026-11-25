@@ -22,4 +22,10 @@ pub trait ChainSource: Send + Sync {
     ) -> Result<Vec<PositionRead>>;
     /// Resolve pool, data provider and the reserve -> token map (at the latest block).
     async fn load_protocol(&self) -> Result<ProtocolInfo>;
+    /// Optional WebSocket notification stream for new heads; polling remains the fallback.
+    async fn subscribe_new_heads(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<()>>> {
+        Ok(None)
+    }
 }

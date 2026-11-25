@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 pub const STREAM_BLOCK_PROCESSED: &str = "stream:block_processed";
+pub const STREAM_ORACLE_UPDATE: &str = "stream:oracle_update";
 
 #[async_trait]
 pub trait Emitter: Send + Sync {
@@ -15,6 +16,14 @@ pub trait Emitter: Send + Sync {
         h: &Header,
         positions_changed: usize,
     );
+    async fn oracle_update(
+        &self,
+        _protocol: &str,
+        _chain_id: u64,
+        _h: &Header,
+        _update: &OracleUpdate,
+    ) {
+    }
 }
 
 pub struct NoopEmitter;
@@ -40,6 +49,29 @@ pub fn block_processed_message(
         "block_hash": hash_str(&h.hash),
         "ts": iso8601(h.timestamp),
         "positions_changed": positions_changed,
+    })
+    .to_string()
+}
+
+pub fn oracle_update_message(
+    protocol: &str,
+    chain_id: u64,
+    h: &Header,
+    update: &OracleUpdate,
+    trace_id: &str,
+) -> String {
+    json!({
+        "schema_version": 1,
+        "trace_id": trace_id,
+        "protocol": protocol,
+        "chain_id": chain_id,
+        "feed": addr_str(&update.feed),
+        "block_number": h.number,
+        "round_id": update.round_id.to_string(),
+        "answer": update.answer,
+        "updated_at": iso8601(update.updated_at),
+        "ts": iso8601(h.timestamp),
+        "log_index": update.log_index,
     })
     .to_string()
 }
@@ -110,6 +142,32 @@ impl Emitter for RedisEmitter {
             tracing::warn!(error = %e, "redis XADD failed (indexing continues)");
         }
     }
+
+    async fn oracle_update(
+        &self,
+        protocol: &str,
+        chain_id: u64,
+        h: &Header,
+        update: &OracleUpdate,
+    ) {
+        let trace = format!("{chain_id}-{}-{}", h.number, update.log_index);
+        let msg = oracle_update_message(protocol, chain_id, h, update, &trace);
+        let mut conn = self.conn.clone();
+        let res: redis::RedisResult<String> = redis::cmd("XADD")
+            .arg(STREAM_ORACLE_UPDATE)
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(self.maxlen)
+            .arg("*")
+            .arg("data")
+            .arg(msg)
+            .query_async(&mut conn)
+            .await;
+        if let Err(e) = res {
+            crate::metrics::EMIT_ERRORS.inc();
+            tracing::warn!(error = %e, "redis oracle XADD failed (indexing continues)");
+        }
+    }
 }
 
 #[async_trait]
@@ -124,6 +182,16 @@ impl Emitter for Box<dyn Emitter> {
         (**self)
             .block_processed(protocol, chain_id, h, positions_changed)
             .await
+    }
+
+    async fn oracle_update(
+        &self,
+        protocol: &str,
+        chain_id: u64,
+        h: &Header,
+        update: &OracleUpdate,
+    ) {
+        (**self).oracle_update(protocol, chain_id, h, update).await
     }
 }
 
@@ -162,5 +230,37 @@ mod tests {
         }
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["block_number"], 7);
+    }
+
+    #[test]
+    fn oracle_message_contains_schema_fields() {
+        let h = Header {
+            number: 7,
+            hash: B256::repeat_byte(1),
+            parent_hash: B256::repeat_byte(2),
+            timestamp: 1_700_000_000,
+        };
+        let update = OracleUpdate {
+            feed: alloy::primitives::Address::repeat_byte(3),
+            round_id: alloy::primitives::U256::from(4u64),
+            answer: "12345".into(),
+            updated_at: 1_700_000_000,
+            log_index: 8,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&oracle_update_message("aave_v3", 1, &h, &update, "t")).unwrap();
+        for key in [
+            "schema_version",
+            "trace_id",
+            "chain_id",
+            "feed",
+            "block_number",
+            "round_id",
+            "answer",
+            "updated_at",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(v["answer"], "12345");
     }
 }

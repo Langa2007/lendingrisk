@@ -3,6 +3,7 @@ use alloy::sol;
 
 sol! {
     // ---- Aave v3 Pool events ----
+    event MintUnbacked(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint16 indexed referralCode);
     event Supply(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint16 indexed referralCode);
     event Withdraw(address indexed reserve, address indexed user, address indexed to, uint256 amount);
     event Borrow(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint8 interestRateMode, uint256 borrowRate, uint16 indexed referralCode);
@@ -12,6 +13,9 @@ sol! {
     event ReserveUsedAsCollateralDisabled(address indexed reserve, address indexed user);
     event ReserveDataUpdated(address indexed reserve, uint256 liquidityRate, uint256 stableBorrowRate, uint256 variableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex);
     event UserEModeSet(address indexed user, uint8 categoryId);
+    event SwapBorrowRateMode(address indexed reserve, address indexed user, uint8 interestRateMode);
+    event RebalanceStableBorrowRate(address indexed reserve, address indexed user);
+    event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
 
     // ---- aToken event: balances move without Pool events ----
     event BalanceTransfer(address indexed from, address indexed to, uint256 value, uint256 index);
@@ -21,6 +25,8 @@ sol! {
     // ---- view calls ----
     function getPool() external view returns (address);
     function getPoolDataProvider() external view returns (address);
+    function getPriceOracle() external view returns (address);
+    function getSourceOfAsset(address asset) external view returns (address);
     function getReservesList() external view returns (address[] memory);
     function getReserveTokensAddresses(address asset) external view returns (address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress);
     function getUserReserveData(address asset, address user) external view returns (

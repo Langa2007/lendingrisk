@@ -10,7 +10,7 @@ duplicates, a simulated reorg leaves state correct. Tag `v0.1.0`.
 indexer/src/
   abi.rs       Aave event + view-call definitions (alloy sol! macro), Multicall3 address
   types.rs     plain data types (Header, RawLog, PositionRead, BlockWrite ...)
-  decode.rs    logs -> "which (asset, account) pairs were touched" + reserve updates + liquidations (pure, tested)
+  decode.rs    AaveV3Adapter: logs -> touched positions, reserve updates, liquidations, oracle updates (pure, tested)
   state.rs     Aave interest-index math ported from MathUtils/WadRayMath (used by the Phase 2 engine)
   chain.rs     trait ChainSource: the blockchain as the indexer sees it
   rpc.rs       ChainSource over JSON-RPC: retry + provider failover, getLogs by range/hash, Multicall3 reads
@@ -21,14 +21,17 @@ indexer/src/
   testutil.rs  scripted fake chain (with reorgs) + in-memory store used by the tests
   main.rs      CLI: backfill | run | status
 db/migrations/0002_indexer_state.sql   position_history, emode, reserve_token, rollback indexes
+db/migrations/0003_stable_debt.sql     stable-debt columns in latest and historical positions
 scripts/mock_rpc.py                    fake Aave node with a /admin/reorg switch (no RPC key needed)
 scripts/verify_state.py                DB-vs-chain sample check + missed-event coverage check
 docs/adr/0004-touch-and-read-state-reconstruction.md
 ```
 
 ### How it works (read this before reading the code)
-1. **Events say WHAT changed, the chain says to WHAT.** For each block, `decode.rs` turns Supply/Withdraw/Borrow/
-   Repay/LiquidationCall/collateral-toggle/aToken-transfer logs into a set of (asset, account) "touches".
+1. **Events say WHAT changed, the chain says to WHAT.** For each block, the adapter turns MintUnbacked,
+   Supply/Withdraw/Borrow/Repay/SwapBorrowRateMode/RebalanceStableBorrowRate/LiquidationCall,
+   collateral-toggle/aToken-transfer logs into a set of (asset, account) "touches"; feed `AnswerUpdated` logs are
+   stored and emitted separately as oracle updates.
    `rpc.rs` then reads the exact scaled balances for those touches at that block in one Multicall3 call.
    (ADR 0004 explains why this beats replaying amounts.)
 2. **One block = one database transaction** (`Store::apply_block`): the block record, position history, latest
@@ -49,7 +52,7 @@ cd ~/tahadhari
 tar xzf ~/Downloads/phase1.tar.gz            # adds indexer/, make/, scripts/, docs/, db/migrations/0002...
 echo 'include make/phase1.mk' >> Makefile     # adds the make targets below
 rustc --version                               # need 1.88+ ; if older:  rustup update stable
-make up && make migrate                       # applies 0001 and the new 0002 (idempotent)
+make up && make migrate                       # applies 0001, 0002, and later migrations (idempotent)
 source engine/.venv/bin/activate
 pip install web3 "psycopg[binary]" eth_abi "eth-hash[pycryptodome]" eth_utils
 ```
@@ -58,7 +61,7 @@ pip install web3 "psycopg[binary]" eth_abi "eth-hash[pycryptodome]" eth_utils
 ## 1. Prove the code on your machine WITHOUT an RPC key
 
 ```bash
-make indexer-test            # 32 tests (needs `make up` for the 3 Postgres tests; others run anywhere)
+make indexer-test            # 39 tests (needs `make up` and TEST_DATABASE_URL for the 3 Postgres tests)
 cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check
 ```
 
@@ -86,7 +89,9 @@ the reorg, and after a crash and restart.
 ## 2. Run it on real Aave (Ethereum mainnet)
 
 1. `.env` needs `RPC_URL` (Alchemy/Infura/QuickNode). Optional: `RPC_URL_BACKUP` for failover,
-   `REDIS_URL=redis://localhost:6379` to emit `stream:block_processed`.
+   `WS_RPC_URL` for `newHeads` notifications (polling remains the fallback), and
+   `REDIS_URL=redis://localhost:6379` to emit `stream:block_processed` and `stream:oracle_update`.
+   `RPC_RPS` controls per-provider rate limiting; `RPC_QUORUM` requires that many matching block headers.
    Backfill reads state at HISTORICAL blocks, so use a provider/plan that serves archive `eth_call`s for your range.
 2. Pick a small recent window first (a day is ~7,200 blocks). Get the head: `make indexer-status` prints it
    once the database has a cursor; or `cast block-number --rpc-url $RPC_URL`.
@@ -95,6 +100,9 @@ the reorg, and after a crash and restart.
    make indexer-run                                          # then tail forever; Ctrl-C to stop
    ```
    Fresh database shortcut: `make indexer-run START=<head-7200>` does both.
+   To bootstrap full history, set `AAVE_V3_START_BLOCK` to the verified Aave deployment block for the selected
+   chain and use an archive RPC provider. This scans from that block and can consume substantial RPC quota; test
+   a bounded range first.
 4. In another terminal: `make verify-state N=1000`. **Phase 1 exit criterion:** SAMPLE 1000/1000 and COVERAGE
    100%. Mismatches print the account, asset and both values; paste them to me.
 
@@ -119,13 +127,17 @@ real-chain surprise is possible: ABI differences in newer Aave versions, provide
 format only); behaviour under real load.
 
 ## Known gaps (documented, not hidden)
-- **Partial coverage by design:** only accounts touched since the start block are known. Full-history bootstrap
-  (all accounts since Aave v3 deployment) needs a bulk source (subgraph/Dune/archive scan); planned as Phase 1b.
-- **Stable-rate debt is not tracked** (variable only). Aave v3 has been disabling stable borrowing.
-- **Flash loans that open debt** (interestRateMode != 0) and **MintedToTreasury** (treasury aToken balance) emit no
-  event we decode; those balances update at the next touch. `verify-state` coverage exposes real occurrences.
+- **Partial coverage unless bootstrapped from deployment:** only accounts touched since the start block are known.
+  Full-history scanning is supported through `AAVE_V3_START_BLOCK`, but must be run with the correct deployment
+  block and an archive RPC provider before claiming full coverage.
+- Stable debt is stored separately from scaled variable debt; stable debt is an accrued on-chain balance.
+- `MintedToTreasury` is not decoded directly; its aToken `BalanceTransfer` is used to touch the affected treasury
+  account when emitted.
 - **eMode category** is stored, but position-level eMode semantics are applied in Phase 2, not here.
-- **Polling, not WebSocket**, every `POLL_MS`; **failover, not quorum** across providers; no client-side rate limiter.
+- Polling remains the fallback when `WS_RPC_URL` is unset or its subscription closes.
+- `RPC_RPS` rate-limits requests per provider. `RPC_QUORUM` requires matching block hashes for header reads;
+  other reads still use retry/failover rather than a quorum.
+- The adapter currently covers event decoding only; RPC state reads and protocol initialization remain Aave v3-specific.
 - `processed_block` has no `protocol` column, so one indexer per chain until Phase 11 adds it.
 - New reserves are picked up when an event for them is seen, and every 1,800 blocks (~6 h).
 
@@ -145,5 +157,5 @@ Read in this order: `types.rs` (structs, derives) -> `state.rs` (integer math, `
 -> `decode.rs` (pattern matching, macros: `dec!`) -> `chain.rs`/`store.rs` (traits, `async_trait`, `Result`/`?`/`anyhow`)
 -> `indexer.rs` (generics `Indexer<C: ChainSource, S: Store, E: Emitter>`, `tokio::select!`) -> `testutil.rs` (test
 doubles, `Arc<Mutex<_>>`) -> `rpc.rs` (closures returning futures, retry/failover) -> `main.rs` (clap, tokio runtime).
-Exercises: (1) add a `Metrics` counter for events per type; (2) implement `FlashLoan` decoding; (3) replace polling
-with `eth_subscribe("newHeads")`; (4) add a token-bucket rate limiter in `rpc.rs`.
+Exercises: (1) add a `Metrics` counter for events per type; (2) add a quorum test for inconsistent providers;
+(3) implement reconnecting WebSocket subscriptions; (4) extend the adapter boundary to protocol state reads.

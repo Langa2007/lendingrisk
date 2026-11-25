@@ -73,7 +73,10 @@ pub struct PositionRead {
     pub asset: Address,
     pub account: Address,
     pub scaled_supply: U256,
+    /// Scaled variable debt, as returned by Aave's PoolDataProvider.
     pub scaled_debt: U256,
+    /// Current stable debt; Aave exposes this as an accrued balance, not a scaled value.
+    pub stable_debt: U256,
     pub collateral_enabled: bool,
 }
 
@@ -99,6 +102,15 @@ pub struct LiquidationRow {
     pub log_index: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleUpdate {
+    pub feed: Address,
+    pub round_id: U256,
+    pub answer: String,
+    pub updated_at: u64,
+    pub log_index: u64,
+}
+
 /// Everything written for one block, in one atomic database transaction.
 #[derive(Debug, Clone)]
 pub struct BlockWrite {
@@ -110,6 +122,7 @@ pub struct BlockWrite {
     pub positions: Vec<PositionRead>,
     pub reserves: Vec<ReserveUpdate>,
     pub liquidations: Vec<LiquidationRow>,
+    pub oracle_updates: Vec<OracleUpdate>,
     pub emodes: Vec<(Address, u8)>,
 }
 
@@ -125,6 +138,7 @@ pub struct ProtocolInfo {
     #[allow(dead_code)] // resolved inside RpcChain for reads; kept for diagnostics
     pub data_provider: Address,
     pub reserves: Vec<ReserveTokens>,
+    pub oracle_feeds: Vec<Address>,
 }
 
 pub fn addr_str(a: &Address) -> String {
